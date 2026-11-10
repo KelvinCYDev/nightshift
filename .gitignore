@@ -1,0 +1,11 @@
+# local state / secrets
+.env
+!.env.example
+
+# OS noise
+.DS_Store
+
+# run detritus
+*.log
+run-summaries/
+.*-shared/

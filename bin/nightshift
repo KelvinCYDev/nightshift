@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# nightshift — dispatch long-running agent jobs to an always-on machine you
+# own, fire-and-forget. The job runs inside that machine's supervised Hermes
+# gateway (API on loopback:8642), reached over an SSH -L tunnel. Closing the
+# laptop does not kill the run.
+#
+# ONE install root:  ~/.nightshift/   (created by ./install.sh)
+#   .env            config (sourced on every call; override root with $NIGHTSHIFT_HOME)
+#   bin/nightshift  the CLI (symlink to the repo copy)
+#   runids.txt      dispatch log, lines "<target> <run_id>" (powers --latest/--watch)
+#   cm-*            SSH ControlMaster sockets (one per target host)
+#   landed/         default destination for --land
+#   run-summaries/ final run JSON per phase (written by supervise)
+#
+# MULTIPLE always-on machines are first-class. Names are declared in .env:
+#   NIGHTSHIFT_TARGETS="home office"       # shell identifiers (no hyphens)
+#   NIGHTSHIFT_HOME_HOST="home-server"     # SSH alias from ~/.ssh/config
+#   NIGHTSHIFT_OFFICE_HOST="office-server"
+# Pick one per call with --on/-t; otherwise NIGHTSHIFT_DEFAULT_TARGET is used.
+# Each target gets its own local tunnel port (18642, 18643, … by position;
+# override per target with NIGHTSHIFT_<NAME>_LOCAL_PORT).
+#
+# Usage:
+#   nightshift "task"                                dispatch → default target
+#   nightshift --on NAME "task"                    dispatch → named target
+#   nightshift --status <run_id>                   status (target auto-resolved)
+#   nightshift --latest                            status of the most recent dispatch
+#   nightshift --watch [run_id] [--file PATH] [--on NAME]
+#                                                  poll until settled/artifact lands, print once
+#   nightshift --land <server-path> [dest] [--on NAME]
+#                                                  rsync finished work back (default ~/.nightshift/landed/)
+#   nightshift supervise <phase.md>... [--on NAME] [--stop HH:MM] [--interval SECS]
+#                                                  chain phases overnight: dispatch each file,
+#                                                  poll to terminal, save its JSON, next phase.
+#                                                  Run it ON the server (ssh host '...') so a
+#                                                  laptop sleep cannot stall the chain mid-shift.
+#   nightshift --doctor                            health-check ALL targets in one shot
+#   nightshift --targets                           list targets, hosts, tunnel ports
+set -euo pipefail
+
+ROOT="${NIGHTSHIFT_HOME:-$HOME/.nightshift}"
+CONF="$ROOT/.env"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+STATE="$ROOT/runids.txt"
+CM_PATH="$ROOT/cm-%r@%h:%p"
+API_PORT_DEF=8642
+LOCAL_PORT_BASE=18642
+
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
+die() { echo "nightshift: $*" >&2; exit 1; }
+
+# --- config / target helpers -------------------------------------------------
+up() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+
+cfg() { # cfg TARGET KEY [default]  → value of NIGHTSHIFT_<TARGET>_<KEY>
+  local var="NIGHTSHIFT_$(up "$1")_$2"
+  local v="${!var:-}"
+  if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "${3:-}"; fi
+}
+
+resolve_target() { # empty arg → NIGHTSHIFT_DEFAULT_TARGET; validates membership
+  local t="${1:-}"
+  [ -n "$t" ] || t="${NIGHTSHIFT_DEFAULT_TARGET:-}"
+  [ -n "$t" ] || die "no target given and NIGHTSHIFT_DEFAULT_TARGET unset (see --targets)"
+  local x found=0
+  for x in $NIGHTSHIFT_TARGETS; do [ "$x" = "$t" ] && found=1; done
+  [ "$found" = 1 ] || die "unknown target '$t' (configured: $NIGHTSHIFT_TARGETS)"
+  printf '%s' "$t"
+}
+
+target_index() {
+  local i=0 t
+  for t in $NIGHTSHIFT_TARGETS; do [ "$t" = "$1" ] && { echo "$i"; return; }; i=$((i+1)); done
+  echo 99
+}
+
+host_for()     { cfg "$1" HOST; }
+api_port_for() { cfg "$1" API_PORT "$API_PORT_DEF"; }
+local_port_for() {
+  local p; p="$(cfg "$1" LOCAL_PORT)"
+  if [ -n "$p" ]; then printf '%s' "$p"; else echo $(( LOCAL_PORT_BASE + $(target_index "$1") )); fi
+}
+
+# --- tunnel + API ------------------------------------------------------------
+# Truth = is the local port answering, NOT whether a master socket claims to
+# be alive (a master can report "running" while its forward failed to bind —
+# seen in the wild). If the port isn't listening: drop any stale master,
+# open a fresh one. "Address already in use" = something is already
+# forwarding = harmless either way.
+ensure_tunnel() { # TARGET
+  local host lport
+  host="$(host_for "$1")"
+  lport="$(local_port_for "$1")"
+  [ -n "$host" ] || die "target $1 has no _HOST in .env"
+  if nc -z 127.0.0.1 "$lport" 2>/dev/null; then return; fi
+  ssh -o "ControlPath=$CM_PATH" -O exit "$host" 2>/dev/null || true
+  ssh -o "ControlPath=$CM_PATH" -o ControlMaster=auto -o ControlPersist=3600 \
+      -f -N -L "127.0.0.1:${lport}:127.0.0.1:$(api_port_for "$1")" "$host" || true
+  sleep 1
+}
+
+# Always read the key from the TARGET's .env, per call — machines run their
+# own gateways with different keys; caching or local greps send the wrong one.
+key_for() { # TARGET
+  ssh -o "ControlPath=$CM_PATH" "$(host_for "$1")" \
+    'grep ^API_SERVER_KEY ~/.hermes/.env | cut -d= -f2'
+}
+
+api() { # api TARGET GET|POST <path> [json-file]
+  local t="$1" method="$2" path="$3" body="${4:-}" key
+  ensure_tunnel "$t"
+  key="$(key_for "$t")"
+  local url="http://127.0.0.1:$(local_port_for "$t")${path}"
+  if [ "$method" = POST ]; then
+    curl -s -m 15 -X POST "$url" -H "Authorization: Bearer $key" \
+      -H 'Content-Type: application/json' --data-binary "@$body"
+  else
+    curl -s -m 10 -H "Authorization: Bearer $key" "$url"
+  fi
+}
+
+# --- run id state ------------------------------------------------------------
+record() { printf '%s %s\n' "$1" "$2" >> "$STATE"; }
+target_of_run() { # target owning a run id (latest matching line), empty if none
+  awk -v id="$1" '$2==id{t=$1} END{if(t)print t}' "$STATE" 2>/dev/null || true
+}
+last_line() { tail -1 "$STATE" 2>/dev/null || true; }
+run_status() { # TARGET RUN_ID → status string ('?' on parse failure)
+  api "$1" GET "/v1/runs/$2" \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("status","?"))' 2>/dev/null || echo '?'
+}
+
+# --- argument parsing ----------------------------------------------------------
+CMD=""; RID=""; FILE=""; TARGET=""; LAND_SRC=""; LAND_DEST=""
+STOP=""; INTERVAL=""; TASK=""; PHASES=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t|--on)      TARGET="${2:-}"; shift 2 ;;
+    --status)     CMD="status";     RID="${2:-}"; shift 2 ;;
+    --latest)     CMD="latest"; shift ;;
+    --watch)      CMD="watch"; shift ;;
+    --file)       FILE="${2:-}"; shift 2 ;;
+    --land)       CMD="land"; LAND_SRC="${2:-}"; shift 2
+                  if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then LAND_DEST="$1"; shift; fi ;;
+    supervise)    CMD="supervise"; shift
+                  while [ $# -gt 0 ]; do
+                    case "$1" in
+                      --stop)     STOP="${2:-}"; shift 2 ;;
+                      --interval) INTERVAL="${2:-}"; shift 2 ;;
+                      *)          PHASES+=("$1"); shift ;;
+                    esac
+                  done ;;
+    --doctor)     CMD="doctor"; shift ;;
+    --targets)    CMD="targets"; shift ;;
+    *)            TASK="$TASK $1"; shift ;;
+  esac
+done
+mkdir -p "$ROOT"
+if [ -n "$TASK" ]; then CMD="dispatch"; fi
+TASK="${TASK# }"
+INTERVAL="${INTERVAL:-60}"
+
+case "$CMD" in
+  status)
+    [ -n "$RID" ] || die "usage: nightshift --status <run_id> [--on TARGET]"
+    [ -n "$TARGET" ] || TARGET="$(target_of_run "$RID")"
+    api "$TARGET" GET "/v1/runs/$RID"; echo ;;
+
+  latest)
+    LINE="$(last_line)"
+    [ -n "$LINE" ] || die "no recorded runs"
+    set -- $LINE
+    api "$1" GET "/v1/runs/$2"; echo ;;
+
+  watch)
+    if [ -z "$RID" ]; then
+      LINE="$(last_line)"
+      [ -n "$LINE" ] || die "no run to watch"
+      set -- $LINE; TARGET="$1"; RID="$2"
+    fi
+    [ -n "$TARGET" ] || TARGET="$(target_of_run "$RID")"
+    # Poll the server-side artifact if given (ground truth beats the
+    # optimistic status field); always exit on a settled state so any
+    # notify pattern fires exactly once.
+    while true; do
+      if [ -n "$FILE" ]; then
+        if ssh -o "ControlPath=$CM_PATH" "$(host_for "$TARGET")" "test -f '$FILE'"; then
+          log "[$TARGET] artifact ready:"
+          ssh -o "ControlPath=$CM_PATH" "$(host_for "$TARGET")" "cat '$FILE'"; break
+        fi
+      else
+        OUT="$(api "$TARGET" GET "/v1/runs/$RID")"
+        ST="$(printf '%s' "$OUT" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("status","?"))' 2>/dev/null || echo '?')"
+        log "[$TARGET] run $RID: $ST"
+        if [ "$ST" != running ] && [ "$ST" != queued ] && [ "$ST" != "?" ]; then
+          printf '%s\n' "$OUT"; break
+        fi
+      fi
+      sleep 60
+    done ;;
+
+  land)
+    [ -n "$LAND_SRC" ] || die "usage: nightshift --land <server-path> [local-dest] [--on TARGET]"
+    TARGET="$(resolve_target "$TARGET")"
+    DEST="${LAND_DEST:-$ROOT/landed}"
+    mkdir -p "$DEST"
+    # openrsync (macOS default) rejects --info=progress2; --progress is portable
+    rsync -az --progress "$(host_for "$TARGET"):${LAND_SRC}" "$DEST/"
+    log "[$TARGET] landed to $DEST" ;;
+
+  supervise)
+    [ ${#PHASES[@]} -gt 0 ] || die "usage: nightshift supervise <phase.md>... [--on TARGET] [--stop HH:MM] [--interval SECS]"
+    TARGET="$(resolve_target "$TARGET")"
+    SUM_DIR="$ROOT/run-summaries"; mkdir -p "$SUM_DIR"
+    log "supervising ${#PHASES[@]} phase(s) on [$TARGET], poll ${INTERVAL}s${STOP:+, hard stop $STOP}"
+    for PH in "${PHASES[@]}"; do
+      if [ -n "$STOP" ] && [ "$(date +%H:%M)" \> "$STOP" ]; then
+        log "wall-clock stop $STOP reached — abandoning remaining phases"; break
+      fi
+      if [ ! -f "$PH" ]; then log "phase file $PH missing — skipping"; continue; fi
+      PHN="$(basename "$PH" .md)"
+      # gateway health through the tunnel: 404=UP (/ is simply undefined),
+      # 000=not listening → attempt one relaunch ON the target (a launchd-
+      # supervised gateway doesn't need this; the nohup path covers the
+      # hand-run one). Never assume recovery happened — verify.
+      H="$(curl -s -o /dev/null -w '%{http_code}' -m 8 "http://127.0.0.1:$(local_port_for "$TARGET")/" || echo 000)"
+      if [ "$H" = "000" ]; then
+        log "[$TARGET] gateway down — attempting relaunch on server"
+        ssh -o "ControlPath=$CM_PATH" "$(host_for "$TARGET")" \
+          'nohup caffeinate -is env HERMES_HOME=$HOME/.hermes "$(command -v hermes || echo "$HOME/.local/bin/hermes")" gateway run >> "$HOME/.hermes/logs/gateway.log" 2>> "$HOME/.hermes/logs/gateway.error.log" &'
+        sleep 15
+      fi
+      # dispatch the phase (JSON built programmatically — never from quoting)
+      PAYLOAD="$ROOT/payload.$PHN.json"
+      PH="$PH" PAYLOAD="$PAYLOAD" python3 -c \
+        'import os,json; json.dump({"input": open(os.environ["PH"]).read()}, open(os.environ["PAYLOAD"],"w"))'
+      RESP="$(api "$TARGET" POST "/v1/runs" "$PAYLOAD")"
+      rm -f "$PAYLOAD"
+      RID2="$(printf '%s' "$RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["run_id"])' 2>/dev/null || true)"
+      if [ -z "$RID2" ]; then
+        log "[$TARGET] phase $PHN dispatch failed: $RESP (continuing to next phase)"
+        continue
+      fi
+      record "$TARGET" "$RID2"
+      log "[$TARGET] phase $PHN dispatched, run_id=$RID2"
+      # poll to terminal; ALWAYS save the run JSON — a cap-cut/failed run
+      # can still hold the complete deliverable.
+      while true; do
+        sleep "$INTERVAL"
+        if [ -n "$STOP" ] && [ "$(date +%H:%M)" \> "$STOP" ]; then
+          log "wall-clock stop reached during $PHN (run $RID2 still settling) — stopping supervision"
+          break 2
+        fi
+        ST="$(run_status "$TARGET" "$RID2")"
+        log "[$TARGET] phase $PHN: $ST"
+        if [ "$ST" != running ] && [ "$ST" != queued ] && [ "$ST" != "?" ]; then
+          api "$TARGET" GET "/v1/runs/$RID2" > "$SUM_DIR/$PHN.json"
+          log "[$TARGET] phase $PHN settled ($ST) — saved $SUM_DIR/$PHN.json"
+          break
+        fi
+      done
+    done
+    log "all phases done — summaries in $SUM_DIR" ;;
+
+  targets)
+    echo "configured targets (default: ${NIGHTSHIFT_DEFAULT_TARGET:-none})"
+    for t in $NIGHTSHIFT_TARGETS; do
+      printf '  %-10s ssh=%-16s api=%s local=%s\n' "$t" "$(host_for "$t")" "$(api_port_for "$t")" "$(local_port_for "$t")"
+    done ;;
+
+  doctor)
+    for t in $NIGHTSHIFT_TARGETS; do
+      echo "== target: $t (host $(host_for "$t"))"
+      ssh -o "ControlPath=$CM_PATH" -o ConnectTimeout=8 "$(host_for "$t")" 'echo ssh: OK $(hostname)' 2>&1 | tail -1
+      ensure_tunnel "$t"
+      curl -s -o /dev/null -w 'gateway: %{http_code} (404=UP loopback-bound, 000=down)\n' -m 8 "http://127.0.0.1:$(local_port_for "$t")/" || echo "gateway: 000 (tunnel down)"
+      KEY="$(key_for "$t")"; [ -n "$KEY" ] && echo "key: found (${#KEY} chars)" || echo "key: MISSING on server"
+      echo
+    done
+    echo "== recorded runs"
+    last_line | sed 's/^/latest: /' || true ;;
+
+  dispatch)
+    [ -n "$TASK" ] || die "usage: nightshift [-t|--on TARGET] \"task\" (see --targets)"
+    TARGET="$(resolve_target "$TARGET")"
+    PAYLOAD="$(mktemp "$ROOT/payload.XXXXXX")"
+    printf '%s' "$TASK" | python3 -c "import sys,json; json.dump({'input': sys.stdin.read()}, open('$PAYLOAD','w'))"
+    OUT="$(api "$TARGET" POST "/v1/runs" "$PAYLOAD")"
+    rm -f "$PAYLOAD"
+    RID="$(printf '%s' "$OUT" | python3 -c 'import sys,json; print(json.load(sys.stdin)["run_id"])' 2>/dev/null || true)"
+    if [ -n "$RID" ]; then
+      record "$TARGET" "$RID"
+      echo "dispatched to [$TARGET] — run_id: $RID"
+      echo "close the laptop; check in the morning: nightshift --status $RID"
+    else
+      echo "dispatch failed:"; printf '%s\n' "$OUT"; exit 1
+    fi ;;
+
+  *) die 'usage: nightshift "task" | --on T "task" | --status <run_id> | --latest | --watch [--file PATH] | --land <path> [dest] | supervise <phase.md>... [--stop HH:MM] | --doctor | --targets' ;;
+esac
